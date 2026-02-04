@@ -57,6 +57,17 @@
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int signo) { (void)signo; g_stop = 1; }
 
+static void setup_signal(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
 // ------------------ helpers ------------------
 static int run_cmd(const char *cmd) {
     int rc = system(cmd);
@@ -645,10 +656,12 @@ static void *rx_thread(void *arg) {
 
         ssize_t n = recvmsg(r->sock, &msg, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue;            // 被信号打断
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue; // 超时
             perror("recvmsg");
             continue;
         }
+
 
         // detect truncation
         if (msg.msg_flags & MSG_TRUNC) {
@@ -747,8 +760,9 @@ int main(int argc, char **argv) {
     int port             = atoi(argv[4]);
     const char *pin_root = argv[5];
 
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    // signal(SIGINT, on_sigint);
+    // signal(SIGTERM, on_sigint);
+    setup_signal();
 
     if (ensure_bpffs_and_dirs(pin_root) != 0) {
         fprintf(stderr, "Failed to setup bpffs/dirs\n");
@@ -902,6 +916,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     // ---- init queue + worker ensured table ----
     struct upd_queue q;
     updq_init(&q);
