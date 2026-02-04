@@ -58,7 +58,7 @@ struct bpf_map_def SEC("maps") topo_drop = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(struct topo_key),
     .value_size = sizeof(struct topo_params),
-    .max_entries = 4096,
+    .max_entries = 65536,
 };
 
 /**
