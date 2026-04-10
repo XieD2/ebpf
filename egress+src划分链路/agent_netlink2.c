@@ -8,13 +8,17 @@
 // 4) Cache dev -> {ifindex, recv_id, rtnl_link*}
 // 5) u32 offset for "protocol ip": offsetof(struct iphdr, saddr) (from IP header start)
 // 6) Ensure-on-demand for per-(dev,src_id) tc rules (avoid missing rules)
+// 7) Input source can be UDP or shared memory ring buffer
 //
 // Build:
 //   gcc -O2 -Wall agent_expend_nl_opt.c -o agent_expend_nl_opt 
-//       -lbpf -lnl-3 -lnl-route-3 -lpthread
+//       -lbpf -lnl-3 -lnl-route-3 -pthread
 //
 // Run:
 //   sudo ./agent_expend_nl_opt ebpf.o classifier egress 9000 /sys/fs/bpf/lsdb 
+//        $(ls /sys/class/net | grep -E '^veth[0-9a-f]+\.0\.1$' | sort -V)
+//
+//   sudo ./agent_expend_nl_opt ebpf.o classifier egress shm:lsdb_link_updates /sys/fs/bpf/lsdb
 //        $(ls /sys/class/net | grep -E '^veth[0-9a-f]+\.0\.1$' | sort -V)
 
 #define _GNU_SOURCE
@@ -23,9 +27,11 @@
 #include <bpf/libbpf.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -36,6 +42,9 @@
 #include <string.h>
 #include <stddef.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 // libnl-route
@@ -49,6 +58,8 @@
 #include <netlink/route/qdisc/htb.h>
 #include <netlink/route/qdisc/netem.h>
 #include <netlink/route/cls/u32.h>
+
+#include "link_shm.h"
 
 #ifndef TC_HANDLE
 #define TC_HANDLE(maj, min) (TC_H_MAJ((maj) << 16) | TC_H_MIN(min))
@@ -172,6 +183,148 @@ static uint64_t mbit_to_bytes_per_sec(uint32_t mbit) {
 }
 
 static uint32_t clamp100_u32(uint32_t v) { return (v > 100) ? 100 : v; }
+
+enum input_mode {
+    INPUT_MODE_UDP = 0,
+    INPUT_MODE_SHM = 1,
+};
+
+struct input_cfg {
+    enum input_mode mode;
+    int port;
+    char shm_path[PATH_MAX];
+};
+
+struct shm_map {
+    int fd;
+    size_t bytes;
+    struct link_shm_region *region;
+    char path[PATH_MAX];
+};
+
+static int is_digits_only(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+    }
+    return 1;
+}
+
+static int resolve_shm_path(const char *name, char *out, size_t outlen) {
+    const char *use = (name && *name) ? name : LINK_SHM_DEFAULT_NAME;
+    int ret;
+
+    if (use[0] == '/') {
+        ret = snprintf(out, outlen, "%s", use);
+    } else {
+        ret = snprintf(out, outlen, "/dev/shm/%s", use);
+    }
+
+    return (ret < 0 || (size_t)ret >= outlen) ? -1 : 0;
+}
+
+static int parse_input_spec(const char *spec, struct input_cfg *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->mode = INPUT_MODE_UDP;
+
+    if (!spec || !*spec) return -1;
+
+    if (strncmp(spec, "shm:", 4) == 0) {
+        cfg->mode = INPUT_MODE_SHM;
+        return resolve_shm_path(spec + 4, cfg->shm_path, sizeof(cfg->shm_path));
+    }
+
+    if (strncmp(spec, "udp:", 4) == 0) {
+        spec += 4;
+    }
+
+    if (!is_digits_only(spec)) return -1;
+
+    char *end = NULL;
+    long port = strtol(spec, &end, 10);
+    if (!end || *end != '\0' || port <= 0 || port > 65535) return -1;
+
+    cfg->mode = INPUT_MODE_UDP;
+    cfg->port = (int)port;
+    return 0;
+}
+
+static uint64_t monotonic_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int shm_map_open_or_create(struct shm_map *map, const char *path) {
+    memset(map, 0, sizeof(*map));
+    map->fd = -1;
+    map->bytes = sizeof(struct link_shm_region);
+
+    if (snprintf(map->path, sizeof(map->path), "%s", path) >= (int)sizeof(map->path)) {
+        return -1;
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        perror("open(shared memory file)");
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        perror("fstat(shared memory file)");
+        close(fd);
+        return -1;
+    }
+
+    if (st.st_size != (off_t)map->bytes) {
+        if (ftruncate(fd, (off_t)map->bytes) != 0) {
+            perror("ftruncate(shared memory file)");
+            close(fd);
+            return -1;
+        }
+    }
+
+    void *p = mmap(NULL, map->bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        perror("mmap(shared memory file)");
+        close(fd);
+        return -1;
+    }
+
+    map->fd = fd;
+    map->region = (struct link_shm_region *)p;
+
+    if (map->region->magic != LINK_SHM_MAGIC ||
+        map->region->version != LINK_SHM_VERSION ||
+        map->region->capacity != LINK_SHM_CAP ||
+        map->region->slot_size != sizeof(struct link_shm_slot)) {
+        memset(map->region, 0, map->bytes);
+        map->region->magic = LINK_SHM_MAGIC;
+        map->region->version = LINK_SHM_VERSION;
+        map->region->capacity = LINK_SHM_CAP;
+        map->region->slot_size = sizeof(struct link_shm_slot);
+        __atomic_store_n(&map->region->write_pos, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&map->region->read_pos, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&map->region->producer_drops, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&map->region->consumer_bad, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&map->region->consumer_heartbeat_ns, 0, __ATOMIC_RELEASE);
+    }
+
+    return 0;
+}
+
+static void shm_map_close(struct shm_map *map) {
+    if (!map) return;
+    if (map->region && map->region != MAP_FAILED) {
+        munmap(map->region, map->bytes);
+    }
+    if (map->fd >= 0) {
+        close(map->fd);
+    }
+    memset(map, 0, sizeof(*map));
+    map->fd = -1;
+}
 
 // ------------------ libnl context ------------------
 struct nl_ctx {
@@ -484,6 +637,8 @@ struct upd_item {
     uint32_t delay_us;
     uint32_t jitter_us;
     uint32_t rate_mbit;
+    uint64_t enqueue_ns;
+    uint64_t rx_seen_ns;
 };
 
 #ifndef UPD_Q_CAP
@@ -554,10 +709,28 @@ struct worker_ctx {
     uint64_t map_ok, map_fail;
     uint64_t tc_ok, tc_fail;
     uint64_t ensure_cnt;
+    uint64_t latency_cnt;
+    uint64_t latency_sum_ns;
+    uint64_t latency_min_ns;
+    uint64_t latency_max_ns;
+    uint64_t shm_to_rx_cnt;
+    uint64_t shm_to_rx_sum_ns;
+    uint64_t shm_to_rx_min_ns;
+    uint64_t shm_to_rx_max_ns;
+    uint64_t rx_to_apply_cnt;
+    uint64_t rx_to_apply_sum_ns;
+    uint64_t rx_to_apply_min_ns;
+    uint64_t rx_to_apply_max_ns;
 };
 
 static inline uint8_t *ensured_cell(struct worker_ctx *w, int dev_idx, int src_id) {
     return &w->ensured[(size_t)dev_idx * 256u + (size_t)(src_id & 0xff)];
+}
+
+static void stat_latency_update(uint64_t v, uint64_t *sum, uint64_t *minv, uint64_t *maxv) {
+    *sum += v;
+    if (*minv == 0 || v < *minv) *minv = v;
+    if (v > *maxv) *maxv = v;
 }
 
 static void *worker_thread(void *arg) {
@@ -604,6 +777,23 @@ static void *worker_thread(void *arg) {
             if (apply_tc_params_link(w->nl, ds->link, recv_id, src_id,
                                      it.delay_us, it.jitter_us, it.rate_mbit) == 0) {
                 w->tc_ok++;
+                if (it.enqueue_ns != 0) {
+                    uint64_t done_ns = monotonic_now_ns();
+                    uint64_t end_to_end = done_ns - it.enqueue_ns;
+                    uint64_t rx_to_apply = (it.rx_seen_ns != 0 && done_ns >= it.rx_seen_ns) ? (done_ns - it.rx_seen_ns) : 0;
+                    uint64_t shm_to_rx = (it.rx_seen_ns != 0 && it.rx_seen_ns >= it.enqueue_ns) ? (it.rx_seen_ns - it.enqueue_ns) : 0;
+
+                    w->latency_cnt++;
+                    stat_latency_update(end_to_end, &w->latency_sum_ns, &w->latency_min_ns, &w->latency_max_ns);
+                    if (shm_to_rx > 0) {
+                        w->shm_to_rx_cnt++;
+                        stat_latency_update(shm_to_rx, &w->shm_to_rx_sum_ns, &w->shm_to_rx_min_ns, &w->shm_to_rx_max_ns);
+                    }
+                    if (rx_to_apply > 0) {
+                        w->rx_to_apply_cnt++;
+                        stat_latency_update(rx_to_apply, &w->rx_to_apply_sum_ns, &w->rx_to_apply_min_ns, &w->rx_to_apply_max_ns);
+                    }
+                }
             } else {
                 w->tc_fail++;
             }
@@ -627,6 +817,16 @@ static uint32_t parse_src_id_from_be(uint32_t src_ip_be) {
     uint32_t h = ntohl(src_ip_be);
     return (uint32_t)(h & 0xff);
 }
+
+struct shm_rx_ctx {
+    struct link_shm_region *region;
+    struct dev_state *devs;
+    int dev_cnt;
+    struct upd_queue *q;
+    char path[PATH_MAX];
+    uint64_t read_pos;
+    uint64_t last_prod_drops;
+};
 
 static void *rx_thread(void *arg) {
     struct rx_ctx *r = (struct rx_ctx *)arg;
@@ -742,26 +942,109 @@ static void *rx_thread(void *arg) {
     return NULL;
 }
 
+static void *shm_rx_thread(void *arg) {
+    struct shm_rx_ctx *r = (struct shm_rx_ctx *)arg;
+    struct timespec idle = { .tv_sec = 0, .tv_nsec = 1000000L }; // 1 ms
+
+    r->read_pos = __atomic_load_n(&r->region->read_pos, __ATOMIC_ACQUIRE);
+    r->last_prod_drops = __atomic_load_n(&r->region->producer_drops, __ATOMIC_ACQUIRE);
+
+    while (!g_stop) {
+        uint64_t write_pos = __atomic_load_n(&r->region->write_pos, __ATOMIC_ACQUIRE);
+
+        if (write_pos < r->read_pos) {
+            fprintf(stderr, "WARN: shm write_pos moved backwards, resync read_pos %llu -> %llu\n",
+                    (unsigned long long)r->read_pos,
+                    (unsigned long long)write_pos);
+            r->read_pos = write_pos;
+        }
+
+        int bad = 0;
+        while (r->read_pos < write_pos) {
+            const struct link_shm_slot *slot =
+                &r->region->slots[r->read_pos % (uint64_t)r->region->capacity];
+            char dev[IF_NAMESIZE];
+            memcpy(dev, slot->dev, IF_NAMESIZE);
+            dev[IF_NAMESIZE - 1] = '\0';
+
+            if (dev[0] == '\0' || ends_with_p(dev)) {
+                bad++;
+                r->read_pos++;
+                continue;
+            }
+
+            int di = dev_state_find(r->devs, r->dev_cnt, dev);
+            if (di < 0) {
+                bad++;
+                r->read_pos++;
+                continue;
+            }
+
+            struct upd_item it;
+            memset(&it, 0, sizeof(it));
+            it.dev_idx   = (uint16_t)di;
+            it.src_ip_be = slot->src_ip_be;
+            it.src_id    = (uint16_t)parse_src_id_from_be(slot->src_ip_be);
+            it.loss      = slot->loss;
+            it.delay_us  = slot->delay_us;
+            it.jitter_us = slot->jitter_us;
+            it.rate_mbit = slot->rate_mbit;
+            it.enqueue_ns = slot->enqueue_ns;
+            it.rx_seen_ns = monotonic_now_ns();
+
+            updq_push(r->q, &it);
+            r->read_pos++;
+        }
+
+        __atomic_store_n(&r->region->read_pos, r->read_pos, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->region->consumer_heartbeat_ns, monotonic_now_ns(), __ATOMIC_RELAXED);
+
+        if (bad > 0) {
+            __atomic_add_fetch(&r->region->consumer_bad, (uint64_t)bad, __ATOMIC_RELAXED);
+            fprintf(stderr, "WARN: shm consumer dropped %d bad slot(s) from %s\n", bad, r->path);
+        }
+
+        uint64_t prod_drops = __atomic_load_n(&r->region->producer_drops, __ATOMIC_ACQUIRE);
+        if (prod_drops != r->last_prod_drops) {
+            fprintf(stderr, "WARN: shm producer drops increased: %llu -> %llu\n",
+                    (unsigned long long)r->last_prod_drops,
+                    (unsigned long long)prod_drops);
+            r->last_prod_drops = prod_drops;
+        }
+
+        if (r->read_pos == write_pos) {
+            nanosleep(&idle, NULL);
+        }
+    }
+
+    return NULL;
+}
+
 // ------------------ main ------------------
 int main(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr,
             "Usage:\n"
-            "  sudo %s <obj.o> <sec_name> <egress|ingress> <port> <pin_root> <dev1> [dev2 ...]\n"
-            "Example:\n"
-            "  sudo %s ebpf.o classifier egress 9000 /sys/fs/bpf/lsdb veth2.0.1 vetha.0.1 veth10.0.1\n",
-            argv[0], argv[0]);
+            "  sudo %s <obj.o> <sec_name> <egress|ingress> <port|udp:port|shm:name> <pin_root> <dev1> [dev2 ...]\n"
+            "Examples:\n"
+            "  sudo %s ebpf.o classifier egress 9000 /sys/fs/bpf/lsdb veth2.0.1 vetha.0.1 veth10.0.1\n"
+            "  sudo %s ebpf.o classifier egress shm:lsdb_link_updates /sys/fs/bpf/lsdb veth2.0.1 vetha.0.1 veth10.0.1\n",
+            argv[0], argv[0], argv[0]);
         return 1;
     }
 
     const char *obj      = argv[1];
     const char *sec      = argv[2];
     const char *dir      = argv[3];
-    int port             = atoi(argv[4]);
+    const char *input_spec = argv[4];
     const char *pin_root = argv[5];
+    struct input_cfg input;
 
-    // signal(SIGINT, on_sigint);
-    // signal(SIGTERM, on_sigint);
+    if (parse_input_spec(input_spec, &input) != 0) {
+        fprintf(stderr, "Bad input spec '%s' (use 9000 / udp:9000 / shm:lsdb_link_updates)\n", input_spec);
+        return 1;
+    }
+
     setup_signal();
 
     if (ensure_bpffs_and_dirs(pin_root) != 0) {
@@ -879,48 +1162,62 @@ int main(int argc, char **argv) {
     }
 
     printf("Pinned map: %s (key_size=%u, value_size=%u)\n", pinned_map, key_size, value_size);
-    printf("UDP agent listening on 0.0.0.0:%d\n", port);
     printf("Payload groups: dev src_ip loss delay_us jitter_us rate_mbit\n");
 
-    // ---- UDP socket ----
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) { perror("socket"); return 1; }
+    int s = -1;
+    int enable_rxq_ovfl = 0;
+    struct shm_map shm_input;
+    memset(&shm_input, 0, sizeof(shm_input));
+    shm_input.fd = -1;
 
-    int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (input.mode == INPUT_MODE_UDP) {
+        printf("UDP agent listening on 0.0.0.0:%d\n", input.port);
 
-    // big receive buffer
-    int rcvbuf = 16 * 1024 * 1024; // 16MB
-    if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
-        perror("setsockopt(SO_RCVBUF)");
+        s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) { perror("socket"); return 1; }
+
+        int one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        int rcvbuf = 16 * 1024 * 1024; // 16MB
+        if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
+            perror("setsockopt(SO_RCVBUF)");
+        }
+        socklen_t optlen = sizeof(rcvbuf);
+        if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
+            printf("SO_RCVBUF=%d\n", rcvbuf);
+        }
+
+        enable_rxq_ovfl = 1;
+        if (setsockopt(s, SOL_SOCKET, SO_RXQ_OVFL, &enable_rxq_ovfl, sizeof(enable_rxq_ovfl)) != 0) {
+            enable_rxq_ovfl = 0;
+        }
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons((uint16_t)input.port);
+
+        if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            perror("bind");
+            close(s);
+            return 1;
+        }
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    } else {
+        if (shm_map_open_or_create(&shm_input, input.shm_path) != 0) {
+            fprintf(stderr, "Failed to open shared memory ring: %s\n", input.shm_path);
+            return 1;
+        }
+        printf("SHM agent attached to %s (capacity=%u slot_size=%u)\n",
+               shm_input.path, shm_input.region->capacity, shm_input.region->slot_size);
     }
-    socklen_t optlen = sizeof(rcvbuf);
-    if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
-        printf("SO_RCVBUF=%d\n", rcvbuf);
-    }
 
-    // enable RXQ overflow counter (Linux)
-    int enable_rxq_ovfl = 1;
-    if (setsockopt(s, SOL_SOCKET, SO_RXQ_OVFL, &enable_rxq_ovfl, sizeof(enable_rxq_ovfl)) != 0) {
-        enable_rxq_ovfl = 0; // not fatal
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("bind");
-        return 1;
-    }
-
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    // ---- init queue + worker ensured table ----
     struct upd_queue q;
     updq_init(&q);
 
@@ -935,28 +1232,52 @@ int main(int argc, char **argv) {
     w.ensured = calloc((size_t)dev_cnt * 256u, 1);
     if (!w.ensured) {
         fprintf(stderr, "OOM ensured\n");
+        if (s >= 0) close(s);
+        shm_map_close(&shm_input);
         return 1;
     }
 
     struct rx_ctx r;
     memset(&r, 0, sizeof(r));
-    r.sock = s;
     r.devs = devs;
     r.dev_cnt = dev_cnt;
     r.q = &q;
+    r.sock = s;
     r.enable_rxq_ovfl = enable_rxq_ovfl;
     r.last_rxq_drops = 0;
 
-    pthread_t th_rx, th_worker;
+    struct shm_rx_ctx sr;
+    memset(&sr, 0, sizeof(sr));
+    sr.region = shm_input.region;
+    sr.devs = devs;
+    sr.dev_cnt = dev_cnt;
+    sr.q = &q;
+    if (input.mode == INPUT_MODE_SHM) {
+        snprintf(sr.path, sizeof(sr.path), "%s", shm_input.path);
+    }
+
+    pthread_t th_input, th_worker;
     if (pthread_create(&th_worker, NULL, worker_thread, &w) != 0) {
         fprintf(stderr, "pthread_create(worker) failed\n");
+        if (s >= 0) close(s);
+        shm_map_close(&shm_input);
+        updq_destroy(&q);
+        free(w.ensured);
         return 1;
     }
-    if (pthread_create(&th_rx, NULL, rx_thread, &r) != 0) {
-        fprintf(stderr, "pthread_create(rx) failed\n");
+
+    void *(*input_thread_fn)(void *) = (input.mode == INPUT_MODE_UDP) ? rx_thread : shm_rx_thread;
+    void *input_thread_arg = (input.mode == INPUT_MODE_UDP) ? (void *)&r : (void *)&sr;
+
+    if (pthread_create(&th_input, NULL, input_thread_fn, input_thread_arg) != 0) {
+        fprintf(stderr, "pthread_create(input) failed\n");
         g_stop = 1;
         pthread_cond_broadcast(&q.cv_nonempty);
         pthread_join(th_worker, NULL);
+        if (s >= 0) close(s);
+        shm_map_close(&shm_input);
+        updq_destroy(&q);
+        free(w.ensured);
         return 1;
     }
 
@@ -966,23 +1287,60 @@ int main(int argc, char **argv) {
         static int tick = 0;
         tick++;
         if (tick % 3 == 0) {
-            printf("[STAT] map_ok=%llu map_fail=%llu tc_ok=%llu tc_fail=%llu ensure=%llu q_drop=%llu\n",
+            uint64_t prod_drops = 0;
+            uint64_t consumer_bad = 0;
+            uint64_t lat_avg_us = 0, lat_min_us = 0, lat_max_us = 0;
+            uint64_t shm_rx_avg_us = 0, shm_rx_min_us = 0, shm_rx_max_us = 0;
+            uint64_t rx_apply_avg_us = 0, rx_apply_min_us = 0, rx_apply_max_us = 0;
+            if (input.mode == INPUT_MODE_SHM && shm_input.region) {
+                prod_drops = __atomic_load_n(&shm_input.region->producer_drops, __ATOMIC_ACQUIRE);
+                consumer_bad = __atomic_load_n(&shm_input.region->consumer_bad, __ATOMIC_ACQUIRE);
+            }
+            if (w.latency_cnt > 0) {
+                lat_avg_us = (w.latency_sum_ns / w.latency_cnt) / 1000ULL;
+                lat_min_us = w.latency_min_ns / 1000ULL;
+                lat_max_us = w.latency_max_ns / 1000ULL;
+            }
+            if (w.shm_to_rx_cnt > 0 && w.shm_to_rx_sum_ns > 0) {
+                shm_rx_avg_us = (w.shm_to_rx_sum_ns / w.shm_to_rx_cnt) / 1000ULL;
+                shm_rx_min_us = w.shm_to_rx_min_ns / 1000ULL;
+                shm_rx_max_us = w.shm_to_rx_max_ns / 1000ULL;
+            }
+            if (w.rx_to_apply_cnt > 0 && w.rx_to_apply_sum_ns > 0) {
+                rx_apply_avg_us = (w.rx_to_apply_sum_ns / w.rx_to_apply_cnt) / 1000ULL;
+                rx_apply_min_us = w.rx_to_apply_min_ns / 1000ULL;
+                rx_apply_max_us = w.rx_to_apply_max_ns / 1000ULL;
+            }
+
+            printf("[STAT] map_ok=%llu map_fail=%llu tc_ok=%llu tc_fail=%llu ensure=%llu q_drop=%llu shm_prod_drop=%llu shm_bad=%llu lat_us(avg/min/max)=%llu/%llu/%llu shm_rx_us=%llu/%llu/%llu rx_apply_us=%llu/%llu/%llu\n",
                    (unsigned long long)w.map_ok,
                    (unsigned long long)w.map_fail,
                    (unsigned long long)w.tc_ok,
                    (unsigned long long)w.tc_fail,
                    (unsigned long long)w.ensure_cnt,
-                   (unsigned long long)q.dropped);
+                   (unsigned long long)q.dropped,
+                   (unsigned long long)prod_drops,
+                   (unsigned long long)consumer_bad,
+                   (unsigned long long)lat_avg_us,
+                   (unsigned long long)lat_min_us,
+                   (unsigned long long)lat_max_us,
+                   (unsigned long long)shm_rx_avg_us,
+                   (unsigned long long)shm_rx_min_us,
+                   (unsigned long long)shm_rx_max_us,
+                   (unsigned long long)rx_apply_avg_us,
+                   (unsigned long long)rx_apply_min_us,
+                   (unsigned long long)rx_apply_max_us);
             fflush(stdout);
         }
     }
 
     // shutdown
     pthread_cond_broadcast(&q.cv_nonempty);
-    pthread_join(th_rx, NULL);
+    pthread_join(th_input, NULL);
     pthread_join(th_worker, NULL);
 
-    close(s);
+    if (s >= 0) close(s);
+    shm_map_close(&shm_input);
     close(map_fd);
     close(prog_fd);
 
